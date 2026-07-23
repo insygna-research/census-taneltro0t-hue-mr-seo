@@ -1,8 +1,8 @@
-"""
-swarm/content_forge — контент-станок: quick-win → черновик статьи по канонам.
+"""Контент-станок: quick-win → проверенный черновик статьи.
 
-Мозг (headless Claude на подписке) пишет черновик В ФАЙЛ content_drafts/ —
-публикация ВСЕГДА за человеком (вычитка обязательна, красная зона контента).
+Codex возвращает только текст в изолированном режиме без доступа к файлам.
+Python валидирует метаблок/объём и лишь затем атомарно сохраняет уникальный
+черновик. Публикация всегда остаётся за человеком.
 
 Каноны зашиты в промпт: L-007 (keywords массив для блога mysite), стиль
 существующего блога, ЭПОС (польза/факты/без воды), запрет канцелярита,
@@ -14,16 +14,19 @@ swarm/content_forge — контент-станок: quick-win → чернов�
 import json
 import os
 import re
-import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-CLAUDE_BIN = os.path.expanduser("~/.npm-global/bin/claude")
+from swarm.brain import run as run_brain
+from swarm.strategy import strategy_context
+from secret_safety import safe_exception
 DRAFTS = ROOT / "content_drafts"
+TIMEOUT = 240
 
 SITE_CTX = {
     "mysite": "Студия звукозаписи Low Light (кан. «Демо-бренд»), Столица (Башня Федерация, Столица-Сити) + Город (Советская 6). Услуги: запись, сведение (от 5000₽), мастеринг (от 3000₽), аранжировки, клипы, песни в подарок. Артисты: Miyagi & Эндшпиль, DSPRITE, Boulevard Depo, LIZER, MIA BOYKA. Тон блога: экспертно, тепло, без воды, конкретные цифры/цены. Формат блога: заголовок H2/H3-структура, FAQ в конце.",
@@ -36,12 +39,18 @@ def forge(site: str, query: str, url: str = "") -> dict:
     ctx = SITE_CTX.get(site)
     if not ctx:
         return {"ok": False, "error": f"неизвестный сайт {site}"}
+    query = " ".join(query.split())[:240]
+    url = url.strip()[:500]
+    if not query:
+        return {"ok": False, "error": "пустой поисковый запрос"}
     slug = re.sub(r"[^a-z0-9-]", "", re.sub(r"\s+", "-", query.lower()
                   .translate(str.maketrans("абвгдеёжзийклмнопрстуфхцчшщъыьэюя", "abvgdeejzijklmnoprstufhccss_y_eua"))))[:60] or "draft"
-    ts = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now()
+    ts = now.strftime("%Y-%m-%d")
+    run_id = now.strftime("%Y-%m-%d-%H%M%S") + f"-{os.getpid()}"
     out_dir = DRAFTS / site
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{ts}-{slug}.md"
+    path = out_dir / f"{run_id}-{slug}.md"
 
     prompt = f"""Напиши черновик SEO-статьи для блога сайта.
 
@@ -63,13 +72,42 @@ def forge(site: str, query: str, url: str = "") -> dict:
 
 Выведи только markdown статьи."""
 
-    r = subprocess.run([CLAUDE_BIN, "-p", prompt, "--model", "sonnet"],
-                       capture_output=True, text=True, timeout=600, cwd=str(ROOT))
-    text = r.stdout.strip()
-    if r.returncode != 0 or len(text) < 400:
-        return {"ok": False, "error": f"claude rc={r.returncode}: {(r.stderr or text)[:200]}"}
-    path.write_text(f"<!-- Mr.Seo content_forge · {ts} · запрос: {query} · НЕ ПУБЛИКОВАТЬ БЕЗ ВЫЧИТКИ -->\n\n" + text,
-                    encoding="utf-8")
+    try:
+        text = run_brain(prompt + "\n\n# СТРАТЕГИЧЕСКИЕ ОГРАНИЧЕНИЯ\n"
+                         + strategy_context(), cwd=ROOT, timeout=TIMEOUT,
+                         read_paths=(), write_paths=())[0]
+    except Exception as exc:
+        return {"ok": False, "error": safe_exception(exc)}
+
+    required = ("TITLE", "DESCRIPTION", "KEYWORDS", "SLUG")
+    missing = [name for name in required
+               if not re.search(rf"(?mi)^{name}:\s*\S", text)]
+    words = re.findall(r"(?u)\b[\w-]+\b", text)
+    if missing:
+        return {"ok": False, "error": "в черновике нет полей: " + ", ".join(missing)}
+    if not 600 <= len(words) <= 1400:
+        return {"ok": False, "error": f"неверный объём черновика: {len(words)} слов"}
+    if "ПРОВЕРИТЬ" not in text.upper():
+        return {"ok": False, "error": "в черновике нет блока «ПРОВЕРИТЬ»"}
+
+    body = (
+        f"<!-- Mr.Seo content_forge · {ts} · запрос: {query} · "
+        "НЕ ПУБЛИКОВАТЬ БЕЗ ВЫЧИТКИ -->\n\n" + text.strip() + "\n"
+    )
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=out_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        Path(temp_name).unlink(missing_ok=True)
+        raise
     try:
         from telegram_notifier import send_long_message
         send_long_message(f"📝 Станок: черновик готов — «{query}» [{site}]\ncontent_drafts/{site}/{path.name}\nЖдёт вычитки.")

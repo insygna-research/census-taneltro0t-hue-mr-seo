@@ -10,18 +10,20 @@ Cron:   понедельник 10:10 (после ai_visibility), com.mrseo.seo-f
 """
 import json
 import os
-import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-CLAUDE_BIN = os.path.expanduser("~/.npm-global/bin/claude")
+from swarm.brain import run as run_brain
+from swarm.strategy import strategy_context
 RUNS = ROOT / "swarm" / "runs"
 WEEK = datetime.now().strftime("%G-W%V")
 OUT = RUNS / f"focus-{WEEK}.json"
+SCHEMA = ROOT / "swarm" / "schemas" / "focus.json"
 
 SITES = ["mysite", "demo2", "demo3"]
 
@@ -77,19 +79,58 @@ PROMPT = """Ты — Mr.Seo, главный SEO-стратег трёх прое
 {"focus":[{"site":"...","title":"...","why":"...","action":"[фокус site] <задача для роя или пометь ЧЕЛОВЕК: ...>","executor":"рой"|"человек"}]}"""
 
 
+def _validate(data: dict) -> dict:
+    items = data.get("focus")
+    if not isinstance(items, list) or len(items) != 3:
+        raise ValueError("фокус должен содержать ровно три дела")
+    sites = [item.get("site") for item in items if isinstance(item, dict)]
+    if len(sites) != 3 or set(sites) != set(SITES):
+        raise ValueError("в фокусе должны быть три уникальных сайта")
+    for item in items:
+        if item.get("executor") not in {"рой", "человек"}:
+            raise ValueError("неизвестный executor")
+        for key in ("title", "why", "action"):
+            if not isinstance(item.get(key), str) or not item[key].strip():
+                raise ValueError(f"пустое поле {key}")
+        if item["executor"] == "рой" and not item["action"].startswith(f"[фокус {item['site']}]"):
+            raise ValueError("задача роя должна иметь безопасный тег сайта")
+    return data
+
+
+def _atomic_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        Path(temp_name).unlink(missing_ok=True)
+        raise
+
+
 def run(force: bool = False) -> dict:
     if OUT.exists() and not force:
-        return json.loads(OUT.read_text(encoding="utf-8"))
+        return _validate(json.loads(OUT.read_text(encoding="utf-8")))
     digest = collect()
-    r = subprocess.run([CLAUDE_BIN, "-p", PROMPT + "\n\n# ДАННЫЕ\n" + digest, "--model", "sonnet"],
-                       capture_output=True, text=True, timeout=480, cwd=str(ROOT))
-    raw = r.stdout.strip()
+    raw = run_brain(PROMPT + "\n\n# ПОСТОЯННАЯ СТРАТЕГИЯ\n"
+                    + strategy_context() + "\n\n# ДАННЫЕ\n" + digest,
+                    cwd=ROOT, timeout=480, read_paths=(), write_paths=(),
+                    output_schema=SCHEMA)[0]
     start, end = raw.find("{"), raw.rfind("}")
-    data = json.loads(raw[start:end + 1])
+    if start < 0 or end <= start:
+        raise ValueError("Codex не вернул JSON")
+    data = _validate(json.loads(raw[start:end + 1]))
     data["week"] = WEEK
     data["generated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-    RUNS.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_json(OUT, data)
     try:
         from telegram_notifier import send_long_message
         send_long_message(f"🎯 Фокус недели {WEEK}:\n" + "\n".join(

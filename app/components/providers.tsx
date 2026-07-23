@@ -49,6 +49,16 @@ export function useChat() {
 /* ------------------------------- Provider ------------------------------- */
 
 const uid = () => Math.random().toString(36).slice(2, 10);
+const CHAT_THREAD_KEY = "mrseo:chat-thread";
+const CHAT_THREAD_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function getChatThreadId(): string {
+  const existing = sessionStorage.getItem(CHAT_THREAD_KEY);
+  if (existing && CHAT_THREAD_RE.test(existing)) return existing;
+  const id = crypto.randomUUID();
+  sessionStorage.setItem(CHAT_THREAD_KEY, id);
+  return id;
+}
 
 export function Providers({ children }: { children: React.ReactNode }) {
   const { t, lang } = useT();
@@ -66,7 +76,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
   // restore site
   useEffect(() => {
     const saved = localStorage.getItem("mrseo:site") as SiteKey | null;
-    if (saved === "mysite" || saved === "demo2" || saved === "demo3") setSiteState(saved);
+    if (saved === "mysite" || saved === "demo2" || saved === "demo3") {
+      // Hydration-safe restore: localStorage is intentionally read after mount.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setSiteState(saved);
+    }
   }, []);
   const setSite = useCallback((s: SiteKey) => {
     setSiteState(s);
@@ -87,7 +101,12 @@ export function Providers({ children }: { children: React.ReactNode }) {
         const res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: trimmed, site: siteRef.current, lang: langRef.current }),
+          body: JSON.stringify({
+            message: trimmed,
+            site: siteRef.current,
+            lang: langRef.current,
+            thread: getChatThreadId(),
+          }),
         });
         if (!res.body) throw new Error("no body");
         const reader = res.body.getReader();

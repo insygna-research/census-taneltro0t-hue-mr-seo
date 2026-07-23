@@ -83,6 +83,15 @@ def actions() -> list:
             br = subprocess.run(["git", "-C", repo, "branch", "--list", "mrseo/*"],
                                 capture_output=True, text=True, timeout=10).stdout
             for b in [x.strip().lstrip("* ") for x in br.splitlines() if x.strip()]:
+                # Старые bridge-ветки часто остаются после merge или указывают
+                # прямо на main. Показываем карточку только если в ветке
+                # действительно есть хотя бы один ещё не смерженный коммит.
+                ahead = subprocess.run(
+                    ["git", "-C", repo, "rev-list", "--count", f"main..{b}"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if ahead.returncode != 0 or int(ahead.stdout.strip() or "0") == 0:
+                    continue
                 todo.append({"kind": "merge", "priority": 1, "key": f"merge:{b}",
                              "title": f"Merge ветки {b} ({site}) — правки готовы, билд проверен",
                              "site": site, "branch": b,

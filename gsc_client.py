@@ -20,6 +20,8 @@ import os
 import time
 from pathlib import Path
 
+from secret_safety import atomic_write_private, safe_exception
+
 ROOT = Path(__file__).resolve().parent
 SA_FILE = Path(os.getenv("GSC_SERVICE_ACCOUNT_FILE", str(ROOT / "credentials" / "gsc.json")))
 TOKEN_FILE = Path(os.getenv("GSC_OAUTH_TOKEN_FILE", str(ROOT / "credentials" / "gsc_token.json")))
@@ -46,14 +48,14 @@ def _refresh_with_retry(creds):
             last_err = e
             if attempt < len(RETRY_DELAYS) - 1:
                 time.sleep(delay)
-    raise GSCAuthError(f"GSC OAuth refresh failed after {len(RETRY_DELAYS)} attempts: {last_err}")
+    raise GSCAuthError(
+        f"GSC OAuth refresh failed after {len(RETRY_DELAYS)} attempts: "
+        f"{safe_exception(last_err)}"
+    )
 
 
 def _save_token_atomic(creds):
-    tmp = str(TOKEN_FILE) + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(creds.to_json())
-    os.replace(tmp, TOKEN_FILE)
+    atomic_write_private(TOKEN_FILE, creds.to_json())
 
 
 def _build_sa_service():
@@ -73,7 +75,10 @@ def _build_sa_service():
             last_err = e
             if attempt < len(RETRY_DELAYS) - 1:
                 time.sleep(delay)
-    raise GSCAuthError(f"SA smoke-test failed after {len(RETRY_DELAYS)} attempts: {last_err}")
+    raise GSCAuthError(
+        f"SA smoke-test failed after {len(RETRY_DELAYS)} attempts: "
+        f"{safe_exception(last_err)}"
+    )
 
 
 def _build_oauth_service():
@@ -117,5 +122,7 @@ def get_service(force_new: bool = False):
         return _service
     except Exception as oauth_err:
         raise GSCAuthError(
-            f"оба пути мертвы. SA: {str(sa_err)[:150] if sa_err else 'файл отсутствует'} | OAuth: {str(oauth_err)[:150]}"
+            f"оба пути мертвы. SA: "
+            f"{safe_exception(sa_err, 150) if sa_err else 'файл отсутствует'} | "
+            f"OAuth: {safe_exception(oauth_err, 150)}"
         )

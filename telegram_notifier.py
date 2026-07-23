@@ -24,6 +24,10 @@ CHAT_ID = os.getenv("TELEGRAM_SEO_CHAT_ID")
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 
+class TelegramAPIError(RuntimeError):
+    """Безопасная ошибка без bot token в URL/тексте исключения."""
+
+
 def _ensure():
     if not TOKEN:
         raise RuntimeError("TELEGRAM_SEO_BOT_TOKEN не задан в .env")
@@ -32,6 +36,29 @@ def _ensure():
             "TELEGRAM_SEO_CHAT_ID пуст. Запусти: python grab_chat_id.py "
             "после того как напишешь /start боту @Seoebaka_bot"
         )
+
+
+def _request(method: str, endpoint: str, **kwargs) -> requests.Response:
+    """Выполняет запрос к Bot API и никогда не раскрывает токен в ошибке.
+
+    requests включает полный URL (вместе с /bot<TOKEN>/) в ProxyError,
+    ConnectionError и HTTPError. Эти исключения попадают в launchd-логи,
+    поэтому наружу отдаём только endpoint, тип сбоя и HTTP-код.
+    """
+    _ensure()
+    try:
+        response = requests.request(method, f"{API}/{endpoint}", **kwargs)
+        response.raise_for_status()
+        return response
+    except requests.RequestException as exc:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            raise TelegramAPIError(
+                f"Telegram API HTTP {response.status_code} ({endpoint})"
+            ) from None
+        raise TelegramAPIError(
+            f"Telegram API недоступен ({endpoint}): {type(exc).__name__}"
+        ) from None
 
 
 def send_message(text: str, parse_mode: str | None = None, disable_preview: bool = True) -> dict:
@@ -45,8 +72,7 @@ def send_message(text: str, parse_mode: str | None = None, disable_preview: bool
         payload["parse_mode"] = parse_mode
     # data=… c utf-8 кодировкой по умолчанию; requests шлёт application/x-www-form-urlencoded.
     # JSON-вариант ниже надёжнее: requests сериализует через json.dumps(ensure_ascii=False по умолч.False, но dumps делает escape) → utf-8 bytes.
-    r = requests.post(f"{API}/sendMessage", json=payload, timeout=15)
-    r.raise_for_status()
+    r = _request("POST", "sendMessage", json=payload, timeout=15)
     return r.json()
 
 
@@ -107,8 +133,7 @@ def send_file(path: str, caption: str | None = None) -> dict:
         data = {"chat_id": CHAT_ID}
         if caption:
             data["caption"] = caption
-        r = requests.post(f"{API}/sendDocument", data=data, files=files, timeout=30)
-    r.raise_for_status()
+        r = _request("POST", "sendDocument", data=data, files=files, timeout=30)
     return r.json()
 
 

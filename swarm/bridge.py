@@ -1,36 +1,34 @@
-"""
-swarm/bridge — мост Mr.Seo ↔ Claude Code для правок сайтов.
+"""Безопасный мост Mr.Seo ↔ Codex для планов и правок сайтов.
 
-Полный аналог claude_bridge из Zoey (teardown «Фея»), но под нашу задачу:
-задача на рост сайта → headless Claude Code В РЕПОЗИТОРИИ сайта → правки.
-
-Безопасность (не обсуждается):
-  • plan-режим (по умолчанию): Claude только ЧИТАЕТ репо и выдаёт план правок.
-  • --apply: правки строго в ветке mrseo/bridge-<ts>; после — build-проверка
-    (урок L-007: молчаливый краш билда), коммит в ветку, возврат на main.
-  • push НИКОГДА не делается автоматически: деплой у сайтов триггерится
-    пушем в main — merge остаётся за человеком (утреннее ревью).
+По умолчанию Codex только читает выбранный репозиторий и выдаёт план. Явный
+``--apply`` создаёт изолированный временный git worktree, проверяет build и
+оставляет отдельную локальную ветку только при успешном результате. Основная
+рабочая копия не переключается; push/merge никогда не выполняются.
 
 Запуск:
   venv/bin/python swarm/bridge.py mysite "усилить перелинковку блога" [--apply]
 Отчёт: swarm/runs/bridge-<ts>.md + Telegram.
 """
+from contextlib import contextmanager
+import fcntl
 import os
+import signal
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from carpathy.register import REPO_PATHS  # единый источник путей к репо
+from secret_safety import redact_secrets
 
-CLAUDE_BIN = os.path.expanduser("~/.npm-global/bin/claude")
+from swarm.brain import run as run_brain
+from swarm.strategy import strategy_context
 RUNS = ROOT / "swarm" / "runs"
-TS = datetime.now().strftime("%Y%m%d-%H%M")
-
-PLAN_TOOLS = "Read,Glob,Grep"
-APPLY_TOOLS = "Read,Glob,Grep,Edit,Write,Bash(npm run build:*),Bash(npm run build)"
+LOCKS = ROOT / "swarm" / "locks"
+TS = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
 
 GUARDRAILS = """
 # Жёсткие рамки (нарушение = провал задачи)
@@ -47,19 +45,151 @@ def git(repo, *args, check=True):
     return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, check=check).stdout.strip()
 
 
-def run_claude_in_repo(repo: str, prompt: str, tools: str, permission_mode: str, timeout: int):
-    # ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ (06.07): пути с пробелами («LOW LIGHT/Low Light web »)
-    # триггерят suspicious-path гейт headless Claude → Edit/Write блокируются.
-    # В этом случае bridge честно возвращает готовый план, а правки применяет
-    # основная Claude-сессия (у неё есть права) или человек. НЕ обходить гейт.
-    r = subprocess.run(
-        [CLAUDE_BIN, "-p", prompt, "--model", "sonnet",
-         "--allowedTools", tools, "--permission-mode", permission_mode],
-        capture_output=True, text=True, timeout=timeout, cwd=repo, env={**os.environ},
+def _sensitive_paths(repo: str | Path) -> list[Path]:
+    """Явные запреты для permission profile, без чтения содержимого."""
+    base = Path(repo).resolve()
+    denied = [
+        base / ".git",
+        base / "node_modules",
+        base / ".next",
+        base / ".vercel",
+        base / "credentials",
+        base / "secrets",
+    ]
+    denied.extend(p for p in base.glob(".env*"))
+    # Монорепо иногда хранят .env на один уровень ниже.
+    for child in base.iterdir():
+        if child.is_dir() and child.name not in {".git", "node_modules", ".next"}:
+            denied.extend(p for p in child.glob(".env*"))
+    return list(dict.fromkeys(denied))
+
+
+def run_ai_in_repo(repo: str, prompt: str, apply_mode: bool, timeout: int):
+    denied = _sensitive_paths(repo)
+    kwargs = (
+        {"read_paths": (), "write_paths": (repo,), "deny_paths": denied}
+        if apply_mode
+        else {"read_paths": (repo,), "write_paths": (), "deny_paths": denied}
     )
-    if r.returncode != 0 and not r.stdout.strip():
-        raise RuntimeError(f"claude rc={r.returncode}: {(r.stderr or '')[:400]}")
-    return r.stdout.strip()
+    return run_brain(prompt, cwd=repo, timeout=timeout, **kwargs)[0]
+
+
+def _run_build(repo: str, timeout: int = 300) -> tuple[int, str]:
+    env = {
+        key: value for key, value in os.environ.items()
+        if key in {"HOME", "PATH", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL"}
+    }
+    env["NODE_ENV"] = "production"
+    proc = subprocess.Popen(
+        ["npm", "run", "build"], cwd=repo, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.communicate(timeout=2)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+        return 124, f"build timeout ({timeout}s)"
+    return proc.returncode, redact_secrets((stdout + stderr)[-1200:])
+
+
+@contextmanager
+def _site_lock(site: str):
+    LOCKS.mkdir(parents=True, exist_ok=True)
+    lock_path = LOCKS / f"bridge-{site}.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.chmod(lock_path, 0o600)
+    with os.fdopen(fd, "r+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _delete_branch_if_present(repo: str, branch: str) -> None:
+    git(repo, "branch", "-D", branch, check=False)
+
+
+def _apply_in_worktree(repo: str, site: str, task: str, base: str, report: list[str]) -> str:
+    branch = f"mrseo/bridge-{TS}"
+    dirty = git(repo, "status", "--porcelain")
+    if dirty:
+        report += ["## Отменено", "", "Основная рабочая копия содержит незакоммиченные изменения."]
+        return f"🌉 Bridge·APPLY {site}: отменён — репозиторий содержит незакоммиченные изменения"
+
+    temp_root = Path(tempfile.mkdtemp(prefix=f"mrseo-{site}-"))
+    worktree = temp_root / "worktree"
+    keep_branch = False
+    added = False
+    try:
+        created = subprocess.run(
+            ["git", "-C", repo, "worktree", "add", "-b", branch, str(worktree), "HEAD"],
+            capture_output=True, text=True,
+        )
+        if created.returncode != 0:
+            raise RuntimeError("git worktree add: " + redact_secrets(created.stderr)[-400:])
+        added = True
+        out = run_ai_in_repo(
+            str(worktree),
+            base + "\nРежим: ПРАВКИ РАЗРЕШЕНЫ в изолированной ветке. "
+            "Внеси только минимальные изменения по задаче.",
+            True,
+            900,
+        )
+        report += ["## Отчёт Codex", "", out, ""]
+        changed = git(str(worktree), "status", "--porcelain")
+        if not changed:
+            report += ["## Итог", "", "Codex не внёс изменений."]
+            return f"🌉 Bridge·APPLY {site}: изменений не потребовалось"
+
+        build_note = "build: пропущен (нет package.json)"
+        if (worktree / "package.json").exists():
+            rc, build_output = _run_build(str(worktree))
+            if rc != 0:
+                report += [
+                    "## Проверка", "",
+                    f"build: ❌ FAIL (код {rc})",
+                    "```", build_output, "```",
+                    "",
+                    "Ветка удалена, изменения не сохранены.",
+                ]
+                return f"🌉 Bridge·APPLY {site}: отменён — build не прошёл"
+            build_note = "build: ✅ OK"
+        report += ["## Проверка", "", build_note, ""]
+
+        git(str(worktree), "add", "-A")
+        subject = " ".join(task.split())[:70]
+        git(
+            str(worktree), "commit", "-m",
+            f"mrseo-bridge: {subject}\n\nCo-Authored-By: OpenAI Codex <noreply@openai.com>",
+        )
+        diff = git(str(worktree), "show", "--stat", "HEAD")
+        keep_branch = True
+        report += [
+            "## Коммит (локальная ветка, БЕЗ push)", "",
+            f"ветка `{branch}`", "```", diff[:1500], "```",
+        ]
+        return f"🌉 Bridge·APPLY {site}: правки в ветке {branch}, build ОК; merge за тобой"
+    finally:
+        if added:
+            subprocess.run(
+                ["git", "-C", repo, "worktree", "remove", "--force", str(worktree)],
+                capture_output=True, text=True,
+            )
+        if not keep_branch:
+            _delete_branch_if_present(repo, branch)
+        try:
+            temp_root.rmdir()
+        except OSError:
+            pass
 
 
 def notify(text: str):
@@ -82,46 +212,36 @@ def main():
         print(f"✗ неизвестный сайт или нет репо: {site}")
         sys.exit(1)
 
-    base = f"Ты работаешь в репозитории сайта ({site}). Задача от Mr.Seo:\n\n{task}\n{GUARDRAILS}"
-    report = [f"# Bridge {TS} · {site} · {'APPLY' if apply_mode else 'PLAN'}", "", f"**Задача:** {task}", ""]
+    task = task.strip()[:2000]
+    base = (
+        f"Ты работаешь в репозитории сайта ({site}). Задача от Mr.Seo:\n\n"
+        f"{task}\n{GUARDRAILS}\n\n# ПОСТОЯННАЯ СТРАТЕГИЯ MR SEO\n\n"
+        f"{strategy_context()}"
+    )
+    report = [
+        f"# Bridge {TS} · {site} · {'APPLY' if apply_mode else 'PLAN'}",
+        "", f"**Задача:** {task}", "",
+    ]
 
-    if not apply_mode:
-        out = run_claude_in_repo(repo, base + "\nРежим: ТОЛЬКО АНАЛИЗ. Изучи код и выдай конкретный план правок (файлы, что менять, риски). Ничего не редактируй.",
-                                 PLAN_TOOLS, "default", 600)
-        report += ["## План от Claude", "", out]
-        verdict = f"🌉 Bridge·PLAN {site}: план готов"
-    else:
-        branch = f"mrseo/bridge-{TS}"
-        prev = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
-        dirty = git(repo, "status", "--porcelain")
-        if dirty:
-            print("✗ репо грязный (незакоммиченные правки) — apply отменён, чтобы ничего не потерять")
-            report += ["## Отменено", "", "Рабочая копия содержит незакоммиченные изменения."]
-            (RUNS / f"bridge-{TS}.md").write_text("\n".join(report), encoding="utf-8")
-            sys.exit(2)
-        git(repo, "checkout", "-b", branch)
+    with _site_lock(site):
         try:
-            out = run_claude_in_repo(repo, base + "\nРежим: ПРАВКИ РАЗРЕШЕНЫ (ты в отдельной ветке). Внеси изменения по задаче.",
-                                     APPLY_TOOLS, "acceptEdits", 1200)
-            report += ["## Отчёт Claude", "", out, ""]
-            # build-проверка (L-007)
-            build_note = "build: пропущен (нет package.json)"
-            if (Path(repo) / "package.json").exists():
-                b = subprocess.run(["npm", "run", "build"], capture_output=True, text=True, cwd=repo, timeout=600)
-                build_note = "build: ✅ OK" if b.returncode == 0 else f"build: ❌ FAIL\n```\n{(b.stdout + b.stderr)[-800:]}\n```"
-            report += [f"## Проверка\n\n{build_note}", ""]
-            changed = git(repo, "status", "--porcelain")
-            if changed:
-                git(repo, "add", "-A")
-                git(repo, "commit", "-m", f"mrseo-bridge: {task[:70]}\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>")
-                diff = git(repo, "show", "--stat", "HEAD")
-                report += ["## Коммит (в ветке, БЕЗ push)", "", f"ветка `{branch}`", "```", diff[:1500], "```"]
-                verdict = f"🌉 Bridge·APPLY {site}: правки в ветке {branch} ({'билд ОК' if '✅' in build_note else 'БИЛД УПАЛ'}), merge за тобой"
+            if not apply_mode:
+                out = run_ai_in_repo(
+                    repo,
+                    base + "\nРежим: ТОЛЬКО АНАЛИЗ. Изучи код и выдай "
+                    "конкретный план правок (файлы, что менять, риски). "
+                    "Ничего не редактируй.",
+                    False,
+                    600,
+                )
+                report += ["## План от Codex", "", out]
+                verdict = f"🌉 Bridge·PLAN {site}: план готов"
             else:
-                report += ["## Итог", "", "Claude не внёс изменений."]
-                verdict = f"🌉 Bridge·APPLY {site}: изменений не потребовалось"
-        finally:
-            git(repo, "checkout", prev, check=False)
+                verdict = _apply_in_worktree(repo, site, task, base, report)
+        except Exception as exc:
+            error = redact_secrets(f"{type(exc).__name__}: {exc}")[:500]
+            report += ["## Ошибка", "", error]
+            verdict = f"🌉 Bridge {site}: ошибка, правки не применены"
 
     RUNS.mkdir(parents=True, exist_ok=True)
     p = RUNS / f"bridge-{TS}.md"

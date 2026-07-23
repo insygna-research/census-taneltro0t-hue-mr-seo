@@ -24,11 +24,14 @@ ROOT = Path(__file__).resolve().parent.parent
 HYP_FILE = ROOT / "carpathy" / "hypotheses.json"
 SNAP_DIR = ROOT / "memory"
 
+# симлинки без пробелов (~/.mrseo-repos) — headless-гейт Claude душит Write
+# в путях с пробелами; через симлинк apply-режим моста работает (фикс 16.07)
+import os
+_R = os.path.expanduser("~/.mrseo-repos")
 REPO_PATHS = {
-    "mysite": "/path/to/site-repo",
-    "demo2": "/path/to/site-repo",
-    "ai_mysite": "/path/to/site-repo",
-    "demo3": "/path/to/site-repo",
+    "mysite": f"{_R}/mysite",
+    "demo2": f"{_R}/demo2",
+    "demo3": f"{_R}/demo3",
 }
 
 

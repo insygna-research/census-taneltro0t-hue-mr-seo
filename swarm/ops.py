@@ -6,6 +6,7 @@ swarm/ops — операции экосистемы для Mr.Seo («Пульт�
   gsc_reauth                 — перевыпуск OAuth-токена GSC (detached, откроет браузер)
   recrawl <site> <url>       — Яндекс.Вебмастер: отправить URL на переобход
   recrawl_quota <site>       — остаток дневной квоты переобхода
+  set_bing_key               — новый ключ читается только из stdin
 
 Запуск: venv/bin/python swarm/ops.py status
 """
@@ -23,6 +24,8 @@ sys.path.insert(0, str(ROOT))
 import requests
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
+
+from secret_safety import atomic_write_private, redact_secrets, safe_exception
 
 
 def _yandex_headers():
@@ -42,13 +45,29 @@ def status() -> dict:
         _build_sa_service()
         out["gsc_sa"] = {"ok": True, "note": "service account жив (бессрочный)"}
     except Exception as e:
-        out["gsc_sa"] = {"ok": False, "error": str(e)[:160]}
+        out["gsc_sa"] = {"ok": False, "error": safe_exception(e, 160)}
+    # Это статус для UI, а не рабочий fallback: не запускаем 8 сетевых
+    # refresh-попыток старого OAuth и не блокируем dashboard на несколько минут.
     try:
-        from gsc_client import _build_oauth_service
-        _build_oauth_service()
-        out["gsc_oauth"] = {"ok": True, "note": "запасной OAuth жив"}
-    except Exception as e:
-        out["gsc_oauth"] = {"ok": False, "error": str(e)[:160], "fix": "gsc_reauth"}
+        from google.oauth2.credentials import Credentials
+        from gsc_client import SCOPES, TOKEN_FILE
+        if not TOKEN_FILE.exists():
+            raise FileNotFoundError
+        oauth_creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+        if oauth_creds.valid:
+            out["gsc_oauth"] = {"ok": True, "note": "запасной OAuth жив"}
+        else:
+            out["gsc_oauth"] = {
+                "ok": False,
+                "error": "запасной OAuth истёк; основной service account продолжает работать",
+                "fix": "gsc_reauth",
+            }
+    except Exception:
+        out["gsc_oauth"] = {
+            "ok": False,
+            "error": "запасной OAuth требует переавторизации",
+            "fix": "gsc_reauth",
+        }
     # Яндекс.Вебмастер
     try:
         uid = os.getenv("YANDEX_USER_ID")
@@ -57,7 +76,7 @@ def status() -> dict:
         out["yandex"] = {"ok": r.status_code == 200,
                          "note": f"{len(r.json().get('hosts', []))} хостов" if r.status_code == 200 else f"HTTP {r.status_code}"}
     except Exception as e:
-        out["yandex"] = {"ok": False, "error": str(e)[:160]}
+        out["yandex"] = {"ok": False, "error": safe_exception(e, 160)}
     # Bing
     try:
         key = os.getenv("BING_API_KEY", "")
@@ -69,7 +88,7 @@ def status() -> dict:
             out["bing"] = {"ok": r.status_code == 200,
                            "note": f"{len(r.json().get('d', []))} сайтов" if r.status_code == 200 else f"HTTP {r.status_code}"}
     except Exception as e:
-        out["bing"] = {"ok": False, "error": str(e)[:160]}
+        out["bing"] = {"ok": False, "error": safe_exception(e, 160)}
     return out
 
 
@@ -95,7 +114,10 @@ def recrawl(site: str, url: str) -> dict:
                       json={"url": url}, timeout=20)
     if r.status_code in (200, 201, 202):
         return {"ok": True, "note": f"URL в очереди переобхода (task {r.json().get('task_id', '?')})"}
-    return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:160]}"}
+    return {
+        "ok": False,
+        "error": f"HTTP {r.status_code}: {redact_secrets(r.text)[:160]}",
+    }
 
 
 def recrawl_quota(site: str) -> dict:
@@ -126,7 +148,7 @@ def aibots(site: str) -> dict:
         txt = requests.get(url.rstrip("/") + "/robots.txt", timeout=15,
                            headers={"User-Agent": "Mozilla/5.0"}).text
     except Exception as e:
-        return {"ok": False, "error": str(e)[:160]}
+        return {"ok": False, "error": safe_exception(e, 160)}
     blocked, lines = [], [ln.strip() for ln in txt.splitlines()]
     cur = None
     for ln in lines:
@@ -153,7 +175,7 @@ def indexnow(site: str, url: str) -> dict:
             "host": host, "key": key, "urlList": [url]})
         return {"ok": r.status_code in (200, 202), "note": f"HTTP {r.status_code}"}
     except Exception as e:
-        return {"ok": False, "error": str(e)[:160]}
+        return {"ok": False, "error": safe_exception(e, 160)}
 
 
 def set_bing_key(key: str) -> dict:
@@ -171,7 +193,7 @@ def set_bing_key(key: str) -> dict:
             out.append(ln)
     if not found:
         out.append(f"BING_API_KEY={key}")
-    env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    atomic_write_private(env_path, "\n".join(out) + "\n")
     os.environ["BING_API_KEY"] = key
     # проверка нового ключа сразу
     try:
@@ -180,7 +202,10 @@ def set_bing_key(key: str) -> dict:
         ok = r.status_code == 200
         return {"ok": ok, "note": "ключ сохранён и работает" if ok else f"сохранён, но Bing ответил HTTP {r.status_code} — проверьте ключ"}
     except Exception as e:
-        return {"ok": False, "note": f"сохранён, проверка не удалась: {str(e)[:100]}"}
+        return {
+            "ok": False,
+            "note": f"сохранён, проверка не удалась: {safe_exception(e, 100)}",
+        }
 
 
 if __name__ == "__main__":
@@ -198,6 +223,8 @@ if __name__ == "__main__":
     elif cmd == "indexnow":
         print(json.dumps(indexnow(sys.argv[2], sys.argv[3]), ensure_ascii=False))
     elif cmd == "set_bing_key":
-        print(json.dumps(set_bing_key(sys.argv[2]), ensure_ascii=False))
+        # Секрет не должен попадать в argv/список процессов.
+        key = sys.stdin.read(257).strip()
+        print(json.dumps(set_bing_key(key), ensure_ascii=False))
     else:
         print(json.dumps({"ok": False, "error": f"неизвестная команда {cmd}"}))

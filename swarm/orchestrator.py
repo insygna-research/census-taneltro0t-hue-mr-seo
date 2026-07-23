@@ -1,12 +1,12 @@
 """
-swarm/orchestrator — рой агентов на headless Claude Code (аналог Zoey OS, ядро).
+swarm/orchestrator — рой агентов на headless Codex CLI.
 
 Трюк Zoey (teardown «Фея» 2026-07-04): инференс через первосторонний `claude`
 бинарь = $0 сверх Max-подписки. Здесь — минимальный оркестратор:
 
   • Сторож (watchman)  — детерминированный Python, LLM не нужен: мёртвые
     источники в снапшотах, протухшие краны, просроченные verify, диск.
-  • Аналитик (analyst) — headless `claude -p`: получает компактный дайджест
+  • Аналитик (analyst) — headless `codex exec`: получает компактный дайджест
     данных ИНЛАЙНОМ (без tool-вызовов — надёжно в headless), пишет сводку
     в Telegram + swarm/runs/.
 
@@ -18,9 +18,7 @@ Cron:    com.mrseo.seo-swarm (ежедневно 09:50, после daily_scan 09
 """
 import glob
 import json
-import os
 import shutil
-import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -31,9 +29,9 @@ TODAY = datetime.now().strftime("%Y-%m-%d")
 RUNS = ROOT / "swarm" / "runs"
 AGENTS = ROOT / "swarm" / "agents"
 
-CLAUDE_BIN = os.path.expanduser("~/.npm-global/bin/claude")
-MODEL = "sonnet"  # дешевле к лимитам Max, для сводки хватает
 TIMEOUT = 480
+from swarm.brain import run as run_brain
+from swarm.strategy import strategy_context
 
 SITES = ["mysite", "demo2", "demo3"]
 # Якорные ВЧ — единственный надёжный сигнал позиции (не шум окна)
@@ -171,22 +169,23 @@ def build_digest(alerts: list[str]) -> str:
 
 # ─────────────────────────── АГЕНТЫ ───────────────────────────
 
-def run_claude(system_md: Path, digest: str) -> str:
-    prompt = system_md.read_text(encoding="utf-8") + "\n\n# ДАННЫЕ\n\n" + digest
-    env = {**os.environ}
+def run_ai(system_md: Path, digest: str) -> str:
+    prompt = (system_md.read_text(encoding="utf-8")
+              + "\n\n# ПОСТОЯННАЯ СТРАТЕГИЯ\n\n" + strategy_context()
+              + "\n\n# ДАННЫЕ\n\n" + digest)
     last = ""
     for attempt, delay in enumerate((0, 60, 300)):  # сеть утром бывает мёртвой пару минут
         if delay:
             import time
             time.sleep(delay)
-        r = subprocess.run(
-            [CLAUDE_BIN, "-p", prompt, "--model", MODEL],
-            capture_output=True, text=True, timeout=TIMEOUT, env=env, cwd=str(ROOT / "swarm"),
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
-        last = (r.stderr or r.stdout)[:300]
-    raise RuntimeError(f"claude после 3 попыток: {last}")
+        try:
+            return run_brain(
+                prompt, cwd=ROOT, timeout=TIMEOUT,
+                read_paths=(), write_paths=(),
+            )[0]
+        except Exception as e:
+            last = str(e)[:300]
+    raise RuntimeError(f"Codex после 3 попыток: {last}")
 
 
 def notify(text: str):
@@ -202,7 +201,7 @@ def run_analyst():
     digest = build_digest(alerts)
     RUNS.mkdir(parents=True, exist_ok=True)
     try:
-        out = run_claude(AGENTS / "analyst.md", digest)
+        out = run_ai(AGENTS / "analyst.md", digest)
     except Exception as e:
         notify(f"⚠️ РОЙ: Аналитик упал: {str(e)[:300]}\n\nАлерты сторожа:\n" + ("\n".join(alerts) or "нет"))
         raise
@@ -232,7 +231,7 @@ def run_chat():
         print("Задай вопрос о своём SEO — отвечу по свежим данным.")
         return
     digest = build_digest(watchman())
-    out = run_claude(AGENTS / "chat.md", digest + f"\n\n# ВОПРОС ПОЛЬЗОВАТЕЛЯ\n\n{question}")
+    out = run_ai(AGENTS / "chat.md", digest + f"\n\n# ВОПРОС ПОЛЬЗОВАТЕЛЯ\n\n{question}")
     print(out)
 
 

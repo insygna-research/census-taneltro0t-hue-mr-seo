@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["focus"],
+  "properties": {
+    "focus": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["site", "title", "why", "action", "executor"],
+        "properties": {
+          "site": {
+            "type": "string",
+            "enum": ["mysite", "demo2", "demo3"]
+          },
+          "title": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 160
+          },
+          "why": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 600
+          },
+          "action": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 500
+          },
+          "executor": {
+            "type": "string",
+            "enum": ["рой", "человек"]
+          }
+        }
+      }
+    }
+  }
+}

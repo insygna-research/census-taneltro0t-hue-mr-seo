@@ -12,6 +12,7 @@
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -19,6 +20,7 @@ from urllib.parse import quote
 import requests
 from dotenv import load_dotenv
 
+from secret_safety import safe_exception
 from sites_config import SITES
 
 load_dotenv()
@@ -46,7 +48,7 @@ def gsc_positions(site_url: str) -> dict:
         from gsc_client import get_service, GSCAuthError
         svc = get_service()
     except Exception as e:
-        return {"error": str(e)[:300]}
+        return {"error": safe_exception(e)}
     end = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
 
@@ -73,7 +75,7 @@ def gsc_positions(site_url: str) -> dict:
             for r in all_rows
         }
     except Exception as e:
-        return {"error": str(e)[:300]}
+        return {"error": safe_exception(e)}
 
 
 def yandex_positions(host_id: str) -> dict:
@@ -93,12 +95,29 @@ def yandex_positions(host_id: str) -> dict:
 
     def fetch(indicator: str) -> dict:
         out = {}
-        r = requests.get(
-            f"{base}/search-queries/popular/", headers=h,
-            params={"order_by": "TOTAL_SHOWS", "query_indicator": indicator},
-            timeout=20,
-        )
-        r.raise_for_status()
+        last_error = None
+        for attempt, delay in enumerate((0, 2, 5), start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                r = requests.get(
+                    f"{base}/search-queries/popular/", headers=h,
+                    params={"order_by": "TOTAL_SHOWS", "query_indicator": indicator},
+                    timeout=30,
+                )
+                r.raise_for_status()
+                break
+            except (requests.Timeout, requests.ConnectionError) as e:
+                last_error = e
+                if attempt == 3:
+                    raise
+            except requests.HTTPError as e:
+                last_error = e
+                status = e.response.status_code if e.response is not None else 0
+                if attempt == 3 or status not in (429, 500, 502, 503, 504):
+                    raise
+        else:
+            raise RuntimeError(f"Yandex Webmaster недоступен: {last_error}")
         payload = r.json()
         # Яндекс на 401/403/прочие беды возвращает JSON с error_code —
         # без проверки это превращалось в тихие «Yandex: 0 зпр»
@@ -126,7 +145,7 @@ def yandex_positions(host_id: str) -> dict:
             }
         return merged
     except Exception as e:
-        return {"error": str(e)[:300]}
+        return {"error": safe_exception(e)}
 
 
 def load_snapshot(site_key: str, date: str) -> dict | None:
@@ -192,7 +211,7 @@ def bing_positions(site_url: str) -> dict:
             }
         return out
     except Exception as e:
-        return {"error": str(e)[:200]}
+        return {"error": safe_exception(e, 200)}
 
 
 def scan_site(site_key: str) -> dict:
