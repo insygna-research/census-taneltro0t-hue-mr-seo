@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import fs from "node:fs";
 import path from "node:path";
 import { SEO_ROOT } from "@/lib/fs-data";
+import { guardLocalApiRequest, readJsonBody } from "@/lib/local-api-security";
 
 export const dynamic = "force-dynamic";
 
@@ -11,8 +12,15 @@ export const dynamic = "force-dynamic";
 const ACKS = path.join(SEO_ROOT, "swarm/tasks/acks.json");
 
 export async function POST(req: NextRequest) {
-  let key = "";
-  try { key = String((await req.json())?.key ?? "").slice(0, 160); } catch {}
+  const denied = guardLocalApiRequest(req, { requireOrigin: true });
+  if (denied) return denied;
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody(req, 1_024);
+  } catch {
+    return NextResponse.json({ ok: false, error: "bad request" }, { status: 400 });
+  }
+  const key = typeof body.key === "string" ? body.key.trim().slice(0, 160) : "";
   if (!key || !/^[a-zа-яё0-9:_,.\-\s«»()]+$/i.test(key)) {
     return NextResponse.json({ ok: false, error: "bad key" }, { status: 400 });
   }

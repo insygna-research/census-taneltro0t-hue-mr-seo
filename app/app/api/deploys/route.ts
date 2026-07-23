@@ -1,7 +1,10 @@
 import { NextRequest } from "next/server";
-import { execFile } from "node:child_process";
 import path from "node:path";
-import { promisify } from "node:util";
+import {
+  guardLocalApiRequest,
+  readJsonBody,
+  runLocalProcess,
+} from "@/lib/local-api-security";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 180;
@@ -12,29 +15,41 @@ export const maxDuration = 180;
 const SEO_AGENT_ROOT = process.env.SEO_AGENT_ROOT ?? path.resolve(process.cwd(), "..");
 const PY = path.join(SEO_AGENT_ROOT, "venv", "bin", "python");
 const SCRIPT = path.join(SEO_AGENT_ROOT, "swarm", "deploys.py");
-const run = promisify(execFile);
-const SITE_KEY_RE = /^[a-z0-9_-]{2,24}$/;
+const SITES = new Set(["mysite", "demo2", "demo3"]);
 const BRANCH_RE = /^mrseo\/[A-Za-z0-9._\/-]{2,60}$/;
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const denied = guardLocalApiRequest(req);
+  if (denied) return denied;
   try {
-    const { stdout } = await run(PY, [SCRIPT, "list"], { cwd: SEO_AGENT_ROOT, timeout: 60_000 });
+    const stdout = await runLocalProcess(PY, [SCRIPT, "list"], {
+      cwd: SEO_AGENT_ROOT,
+      signal: req.signal,
+      timeoutMs: 60_000,
+    });
     return Response.json(JSON.parse(stdout.trim()));
-  } catch (e) {
-    return Response.json({ error: String(e).slice(0, 200) }, { status: 500 });
+  } catch {
+    return Response.json({ error: "операция временно недоступна" }, { status: 503 });
   }
 }
 
 export async function POST(req: NextRequest) {
+  const denied = guardLocalApiRequest(req, { requireOrigin: true });
+  if (denied) return denied;
   try {
-    const b = await req.json();
-    const site = String(b?.site ?? ""), branch = String(b?.branch ?? "");
-    if (!SITE_KEY_RE.test(site) || !BRANCH_RE.test(branch)) {
+    const body = await readJsonBody(req, 4_096);
+    const site = typeof body.site === "string" ? body.site : "";
+    const branch = typeof body.branch === "string" ? body.branch : "";
+    if (!SITES.has(site) || !BRANCH_RE.test(branch)) {
       return Response.json({ ok: false, error: "неверные site/branch" }, { status: 400 });
     }
-    const { stdout } = await run(PY, [SCRIPT, "merge", site, branch], { cwd: SEO_AGENT_ROOT, timeout: 170_000 });
+    const stdout = await runLocalProcess(PY, [SCRIPT, "merge", site, branch], {
+      cwd: SEO_AGENT_ROOT,
+      signal: req.signal,
+      timeoutMs: 170_000,
+    });
     return Response.json(JSON.parse(stdout.trim()));
-  } catch (e) {
-    return Response.json({ ok: false, error: String(e).slice(0, 200) }, { status: 500 });
+  } catch {
+    return Response.json({ ok: false, error: "операция временно недоступна" }, { status: 503 });
   }
 }

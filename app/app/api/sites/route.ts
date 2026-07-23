@@ -1,26 +1,46 @@
 import { NextRequest, NextResponse } from "next/server";
 import { appendNewSite } from "@/lib/agents";
+import { guardLocalApiRequest, readJsonBody } from "@/lib/local-api-security";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
-  let url = "";
-  let name = "";
-  let connections: string[] = [];
+  const denied = guardLocalApiRequest(req, { requireOrigin: true });
+  if (denied) return denied;
+  let body: Record<string, unknown>;
   try {
-    const body = await req.json();
-    url = String(body?.url ?? "").trim();
-    name = String(body?.name ?? "").trim();
-    if (Array.isArray(body?.connections)) {
-      connections = body.connections.map((c: unknown) => String(c)).slice(0, 12);
-    }
+    body = await readJsonBody(req, 8_192);
   } catch {
-    /* ignore */
+    return NextResponse.json({ error: "invalid request" }, { status: 400 });
   }
 
-  if (!url || !name) {
+  const urlRaw = typeof body.url === "string" ? body.url.trim() : "";
+  const name = typeof body.name === "string" ? body.name.trim().slice(0, 120) : "";
+  const connections = Array.isArray(body.connections)
+    ? body.connections
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim().slice(0, 80))
+      .filter(Boolean)
+      .slice(0, 12)
+    : [];
+  let url = "";
+  try {
+    const parsed = new URL(urlRaw);
+    if (
+      !["http:", "https:"].includes(parsed.protocol) ||
+      parsed.username ||
+      parsed.password ||
+      parsed.hash ||
+      urlRaw.length > 2_048
+    ) throw new Error("invalid URL");
+    url = parsed.toString();
+  } catch {
+    // handled by the common validation response below
+  }
+
+  if (!url || !name || /[\u0000-\u001f\u007f]/.test(name + connections.join(""))) {
     return NextResponse.json(
-      { error: "empty", message: "Нужны название и URL сайта." },
+      { error: "invalid", message: "Нужны корректные название и URL сайта." },
       { status: 400 }
     );
   }
@@ -28,10 +48,10 @@ export async function POST(req: NextRequest) {
   try {
     const task = appendNewSite({ url, name, connections });
     return NextResponse.json({ ok: true, task });
-  } catch (e) {
+  } catch {
     return NextResponse.json(
-      { error: "append_failed", message: String(e) },
-      { status: 500 }
+      { error: "append_failed", message: "Не удалось добавить задачу." },
+      { status: 503 }
     );
   }
 }

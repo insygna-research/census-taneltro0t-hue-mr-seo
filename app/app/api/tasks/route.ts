@@ -1,10 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { appendTask, readTasks, readWorkerStatus } from "@/lib/agents";
 import { taskCore } from "@/lib/utils";
+import { guardLocalApiRequest, readJsonBody } from "@/lib/local-api-security";
 
 export const dynamic = "force-dynamic";
 
-export function GET() {
+export function GET(req: NextRequest) {
+  const denied = guardLocalApiRequest(req);
+  if (denied) return denied;
   try {
     return NextResponse.json({ ...readTasks(), worker: readWorkerStatus() });
   } catch (e) {
@@ -13,15 +16,17 @@ export function GET() {
 }
 
 export async function POST(req: NextRequest) {
-  let text = "";
+  const denied = guardLocalApiRequest(req, { requireOrigin: true });
+  if (denied) return denied;
+  let body: Record<string, unknown>;
   try {
-    const body = await req.json();
-    text = String(body?.text ?? "").trim();
+    body = await readJsonBody(req, 4_096);
   } catch {
-    /* ignore */
+    return NextResponse.json({ error: "invalid request" }, { status: 400 });
   }
-  if (!text) {
-    return NextResponse.json({ error: "empty" }, { status: 400 });
+  const text = typeof body.text === "string" ? body.text.trim() : "";
+  if (!text || text.length > 1_000 || /[\u0000-\u001f\u007f]/.test(text)) {
+    return NextResponse.json({ error: "invalid task" }, { status: 400 });
   }
   try {
     // дедуп: такая же незакрытая задача уже в очереди → не плодим
@@ -31,7 +36,10 @@ export async function POST(req: NextRequest) {
     }
     const task = appendTask(text);
     return NextResponse.json({ ok: true, task });
-  } catch (e) {
-    return NextResponse.json({ error: "append_failed", message: String(e) }, { status: 500 });
+  } catch {
+    return NextResponse.json(
+      { error: "append_failed", message: "Не удалось добавить задачу." },
+      { status: 503 },
+    );
   }
 }
