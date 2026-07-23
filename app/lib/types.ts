@@ -415,6 +415,7 @@ export interface OpsStatus {
   gsc_oauth: OpsTokenState;
   yandex: OpsTokenState;
   bing: OpsTokenState;
+  timeweb: OpsTokenState;
 }
 export interface OpsResult {
   ok: boolean;
@@ -461,6 +462,8 @@ export interface TodayAction {
   url?: string; // ссылка для review
   site?: string; // для kind=merge: ключ сайта (для кнопки «Слить и задеплоить»)
   branch?: string; // для kind=merge: ветка mrseo/*
+  expected_sha?: string; // SHA ветки в момент показа карточки
+  delivery?: string; // что происходит после push для конкретного сайта
 }
 
 export interface TodayResponse {
@@ -477,8 +480,12 @@ export interface DeployPending {
   branch: string;
   date: string;
   sha: string;
+  expected_sha: string;
   task: string;
   stage: "awaiting_merge";
+  delivery: string;
+  deployment_mode: "timeweb_autodeploy" | "timeweb_cron" | "auto_deploy";
+  blocked_reason?: string | null;
 }
 
 export interface DeployMerged {
@@ -502,6 +509,8 @@ export interface DeployMergeResult {
   ok: boolean;
   note?: string;
   error?: string;
+  deployment_mode?: string;
+  merge_sha?: string;
 }
 
 // ---- Раунд 11: «Фокус недели» (swarm/focus.py) ----

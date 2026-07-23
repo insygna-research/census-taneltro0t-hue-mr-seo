@@ -247,8 +247,13 @@ function ActionCard({ action, index }: { action: TodayAction; index: number }) {
       {/* merge — боевая кнопка «Слить и задеплоить» + команда-fallback */}
       {action.kind === "merge" && (
         <div className="mt-4 space-y-2.5 pl-2">
-          {action.site && action.branch && (
-            <MergeDeployButton site={action.site} branch={action.branch} />
+          {action.site && action.branch && action.expected_sha && action.delivery && (
+            <MergeDeployButton
+              site={action.site}
+              branch={action.branch}
+              expectedSha={action.expected_sha}
+              delivery={action.delivery}
+            />
           )}
           {action.hint && (
             <div className="flex items-center gap-2 rounded-xl border border-line bg-black/40 px-3 py-2.5">

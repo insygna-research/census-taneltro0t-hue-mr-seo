@@ -2,7 +2,7 @@
 swarm/ops — операции экосистемы для Mr.Seo («Пульт»).
 
 Команды (stdout = JSON, зовутся из Next /api/ops):
-  status                     — здоровье токенов/ключей всех источников
+  status                     — здоровье поисковых и Timeweb-доступов
   gsc_reauth                 — перевыпуск OAuth-токена GSC (detached, откроет браузер)
   recrawl <site> <url>       — Яндекс.Вебмастер: отправить URL на переобход
   recrawl_quota <site>       — остаток дневной квоты переобхода
@@ -89,6 +89,42 @@ def status() -> dict:
                            "note": f"{len(r.json().get('d', []))} сайтов" if r.status_code == 200 else f"HTTP {r.status_code}"}
     except Exception as e:
         out["bing"] = {"ok": False, "error": safe_exception(e, 160)}
+    # Timeweb Cloud: только безопасная read-only проверка. Баланс, IP,
+    # переменные приложений и сам токен в UI не возвращаются.
+    try:
+        token = os.getenv("TIMEWEB_API_TOKEN", "")
+        if not token:
+            out["timeweb"] = {"ok": False, "error": "TIMEWEB_API_TOKEN не задан"}
+        else:
+            r = requests.get(
+                "https://api.timeweb.cloud/api/v1/apps",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15,
+            )
+            if r.status_code == 200:
+                apps = r.json().get("apps", [])
+                active = sum(
+                    1 for app in apps
+                    if isinstance(app, dict) and app.get("status") == "active"
+                )
+                autodeploy = sum(
+                    1 for app in apps
+                    if isinstance(app, dict) and app.get("is_auto_deploy") is True
+                )
+                out["timeweb"] = {
+                    "ok": True,
+                    "note": f"API жив: {active} активных приложений, автодеплой у {autodeploy}",
+                }
+            else:
+                out["timeweb"] = {
+                    "ok": False,
+                    "error": f"Timeweb API HTTP {r.status_code}",
+                }
+    except Exception as e:
+        out["timeweb"] = {"ok": False, "error": safe_exception(e, 160)}
     return out
 
 

@@ -175,6 +175,7 @@ const TOKEN_ROWS: { key: keyof Omit<OpsStatus, "checked_at">; nameKey: string; k
   { key: "gsc_oauth", nameKey: "pult.tok_gsc_oauth", kind: "Google" },
   { key: "yandex", nameKey: "pult.tok_yandex", kind: "Yandex" },
   { key: "bing", nameKey: "pult.tok_bing", kind: "Bing" },
+  { key: "timeweb", nameKey: "pult.tok_timeweb", kind: "Hosting" },
 ];
 
 function TokensSection() {
@@ -256,7 +257,7 @@ function TokensSection() {
 
       <div className="mt-5 space-y-3">
         {loading || !status
-          ? [0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-[76px]" />)
+          ? [0, 1, 2, 3, 4].map((i) => <Skeleton key={i} className="h-[76px]" />)
           : TOKEN_ROWS.map((row) => {
               const st = status[row.key];
               const isOauth = row.key === "gsc_oauth";

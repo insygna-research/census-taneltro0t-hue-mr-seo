@@ -3,7 +3,9 @@
 По умолчанию Codex только читает выбранный репозиторий и выдаёт план. Явный
 ``--apply`` создаёт изолированный временный git worktree, проверяет build и
 оставляет отдельную локальную ветку только при успешном результате. Основная
-рабочая копия не переключается; push/merge никогда не выполняются.
+рабочая копия не переключается; сам bridge никогда не выполняет push/merge.
+Для этого существует отдельный двухшаговый deploy-контур: build → merge →
+push, после чего сайт забирает Timeweb autodeploy или Демо-бренд cron.
 
 Запуск:
   venv/bin/python swarm/bridge.py mysite "усилить перелинковку блога" [--apply]
@@ -177,7 +179,10 @@ def _apply_in_worktree(repo: str, site: str, task: str, base: str, report: list[
             "## Коммит (локальная ветка, БЕЗ push)", "",
             f"ветка `{branch}`", "```", diff[:1500], "```",
         ]
-        return f"🌉 Bridge·APPLY {site}: правки в ветке {branch}, build ОК; merge за тобой"
+        return (
+            f"🌉 Bridge·APPLY {site}: правки в ветке {branch}, build ОК; "
+            "публикация — отдельной deploy-кнопкой"
+        )
     finally:
         if added:
             subprocess.run(

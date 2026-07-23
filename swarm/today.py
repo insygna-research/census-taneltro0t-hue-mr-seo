@@ -11,14 +11,12 @@ swarm/today — панель «Сегодня»: inbox zero для SEO.
 import glob
 import json
 import re
-import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from carpathy.register import REPO_PATHS
 
 NOW = datetime.now()
 DAY_AGO = NOW - timedelta(hours=24)
@@ -76,28 +74,26 @@ def _lock_fresh(agent: str, minutes: int = 20) -> bool:
 def actions() -> list:
     todo = []
     # 1) незамерженные ветки моста
-    for site, repo in REPO_PATHS.items():
-        if not Path(repo or "").exists():
-            continue
-        try:
-            br = subprocess.run(["git", "-C", repo, "branch", "--list", "mrseo/*"],
-                                capture_output=True, text=True, timeout=10).stdout
-            for b in [x.strip().lstrip("* ") for x in br.splitlines() if x.strip()]:
-                # Старые bridge-ветки часто остаются после merge или указывают
-                # прямо на main. Показываем карточку только если в ветке
-                # действительно есть хотя бы один ещё не смерженный коммит.
-                ahead = subprocess.run(
-                    ["git", "-C", repo, "rev-list", "--count", f"main..{b}"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                if ahead.returncode != 0 or int(ahead.stdout.strip() or "0") == 0:
-                    continue
-                todo.append({"kind": "merge", "priority": 1, "key": f"merge:{b}",
-                             "title": f"Merge ветки {b} ({site}) — правки готовы, билд проверен",
-                             "site": site, "branch": b,
-                             "hint": f"cd в репо → git merge {b} → push = автодеплой"})
-        except Exception:
-            pass
+    try:
+        from swarm.deploys import list_deploys
+
+        for deploy in list_deploys().get("pending", []):
+            if deploy.get("blocked_reason"):
+                continue
+            branch = deploy["branch"]
+            todo.append({
+                "kind": "merge",
+                "priority": 1,
+                "key": f"merge:{branch}",
+                "title": f"Merge ветки {branch} ({deploy['site']}) — правки готовы, билд проверен",
+                "site": deploy["site"],
+                "branch": branch,
+                "expected_sha": deploy["expected_sha"],
+                "delivery": deploy["delivery"],
+                "hint": f"явное подтверждение → build → merge {branch} → push origin/main",
+            })
+    except Exception:
+        pass
     # 2) свежие отзывы (ответить)
     try:
         from swarm.insights import reviews

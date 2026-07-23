@@ -292,7 +292,19 @@ function PendingCard({ deploy, index, onMerged }: { deploy: DeployPending; index
           <Pipeline activeIndex={0} color={IRIS} />
         </div>
         <div className="mt-5">
-          <MergeDeployButton site={deploy.site} branch={deploy.branch} onMerged={onMerged} />
+          {deploy.blocked_reason ? (
+            <div className="rounded-xl border border-warn/30 bg-warn/[0.06] px-4 py-3 text-[12.5px] leading-relaxed text-warn">
+              {deploy.blocked_reason}
+            </div>
+          ) : (
+            <MergeDeployButton
+              site={deploy.site}
+              branch={deploy.branch}
+              expectedSha={deploy.expected_sha}
+              delivery={deploy.delivery}
+              onMerged={onMerged}
+            />
+          )}
         </div>
       </div>
     </motion.article>

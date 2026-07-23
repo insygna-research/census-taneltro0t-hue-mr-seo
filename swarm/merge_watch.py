@@ -29,9 +29,63 @@ DEFAULT_TARGETS = {
 }
 
 
+def register_deploy(
+    site: str,
+    merge_sha: str,
+    source_sha: str,
+    branch: str,
+    deployment_mode: str,
+) -> str:
+    """Регистрирует эксперимент от даты фактического push, а не старой ветки."""
+    repo = REPO_PATHS.get(site)
+    if not repo or not Path(repo).exists():
+        return ""
+    merge_short = merge_sha[:7]
+    source_short = source_sha[:7]
+    data = json.loads(HYP.read_text(encoding="utf-8"))
+    known = {str(h.get("commit", "")) for h in data["hypotheses"]}
+    if merge_short in known or merge_sha in known:
+        return ""
+    date = subprocess.run(
+        ["git", "-C", repo, "log", "-1", "--format=%cs", merge_sha],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    ).stdout.strip()
+    if not date:
+        return ""
+    targets = DEFAULT_TARGETS.get(site, [])
+    verify_due = (
+        datetime.strptime(date, "%Y-%m-%d") + timedelta(days=14)
+    ).strftime("%Y-%m-%d")
+    data["hypotheses"].append({
+        "id": f"h-{merge_short}",
+        "commit": merge_short,
+        "source_commits": [source_short],
+        "commit_date": date,
+        "site": site,
+        "urls": [],
+        "change": f"[авто/deploy] {branch}",
+        "targets_moved": targets,
+        "expected": (
+            f"улучшение по {len(targets)} таргетам за 14 дней "
+            "(push принят, delivery запущен)"
+        ),
+        "baseline": baseline_from_snapshot(site, targets, date),
+        "status": "pending",
+        "verify_due": verify_due,
+        "deployment_mode": deployment_mode,
+        "registered_by": "swarm/deploys.py (после push)",
+    })
+    HYP.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return f"h-{merge_short}"
+
+
 def scan() -> list[str]:
     data = json.loads(HYP.read_text(encoding="utf-8"))
     known = {h.get("commit") for h in data["hypotheses"] if h.get("commit")}
+    for hypothesis in data["hypotheses"]:
+        known.update(hypothesis.get("source_commits") or [])
     added = []
     for site, repo in REPO_PATHS.items():
         if not Path(repo or "").exists():

@@ -18,17 +18,22 @@ type Phase = "idle" | "confirm" | "busy" | "done" | "err";
 export function MergeDeployButton({
   site,
   branch,
+  expectedSha,
+  delivery,
   onMerged,
   className,
 }: {
   site: string;
   branch: string;
+  expectedSha: string;
+  delivery: string;
   onMerged?: (note: string) => void;
   className?: string;
 }) {
   const { t } = useT();
   const [phase, setPhase] = useState<Phase>("idle");
   const [err, setErr] = useState("");
+  const [doneNote, setDoneNote] = useState("");
 
   const fire = async () => {
     if (phase === "busy" || phase === "done") return;
@@ -38,10 +43,11 @@ export function MergeDeployButton({
       const r = await fetch("/api/deploys", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ site, branch }),
+        body: JSON.stringify({ site, branch, expectedSha, confirm: true }),
       });
       const d = (await r.json()) as DeployMergeResult;
       if (d.ok) {
+        setDoneNote(d.note ?? "");
         setPhase("done");
         onMerged?.(d.note ?? "");
       } else {
@@ -89,7 +95,7 @@ export function MergeDeployButton({
             <div className="flex items-start gap-2.5">
               <TriangleAlert size={15} className="mt-0.5 flex-none text-warn" />
               <p className="text-[13px] leading-snug text-ink">
-                {t("deploys.merge_confirm_q", { branch })}
+                {t("deploys.merge_confirm_q", { branch, delivery })}
               </p>
             </div>
             <div className="mt-3 flex items-center gap-2">
@@ -145,7 +151,7 @@ export function MergeDeployButton({
             className="inline-flex items-center gap-2 rounded-lg bg-good/15 px-4 py-2.5 text-[12.5px] font-600 text-good"
           >
             <Check size={14} strokeWidth={3} />
-            {t("deploys.merge_done")}
+            <span>{doneNote || t("deploys.merge_done")}</span>
           </motion.div>
         )}
 
