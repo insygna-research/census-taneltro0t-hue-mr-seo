@@ -62,13 +62,13 @@ def _build_sa_service():
     """Основной путь: service account — бессрочный, без refresh-токенов."""
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    creds = service_account.Credentials.from_service_account_file(str(SA_FILE), scopes=SCOPES)
-    svc = build("searchconsole", "v1", credentials=creds, cache_discovery=False)
-    # smoke-test с retry (утренние DPI-флейки TLS): без него тихо вернём клиент,
-    # который упадёт на первом запросе, и daily_scan запишет error в снапшот
+    # весь путь (чтение ключа + build + smoke-test) под retry: 02-03.08 скан
+    # падал на самом чтении SA-файла (OSError Errno 11 deadlock под launchd)
     last_err = None
     for attempt, delay in enumerate(RETRY_DELAYS):
         try:
+            creds = service_account.Credentials.from_service_account_file(str(SA_FILE), scopes=SCOPES)
+            svc = build("searchconsole", "v1", credentials=creds, cache_discovery=False)
             svc.sites().list().execute()
             return svc
         except Exception as e:

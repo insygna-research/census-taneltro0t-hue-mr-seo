@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 SESS_FILE = ROOT / "swarm" / "assistant_sessions_codex_v2.json"
 LOCK_FILE = ROOT / "swarm" / "assistant_sessions_codex_v2.lock"
-TIMEOUT = 220
+TIMEOUT = 300  # Opus думает дольше codex; фолбэк-цепочка внутри brain.run
 from swarm.brain import run as run_brain
 from swarm.strategy import strategy_context
 from secret_safety import atomic_write_private, safe_exception

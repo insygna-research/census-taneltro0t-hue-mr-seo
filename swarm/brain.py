@@ -46,6 +46,33 @@ def _find_codex() -> str:
 
 CODEX_BIN = _find_codex()
 MODEL = os.getenv("MRSEO_CODEX_MODEL", "").strip()
+
+
+def _find_claude() -> str | None:
+    configured = os.getenv("CLAUDE_BIN", "").strip()
+    if configured and Path(configured).is_file() and os.access(configured, os.X_OK):
+        return configured
+    return shutil.which("claude") or next(
+        (p for p in (
+            str(Path.home() / ".npm-global/bin/claude"),
+            str(Path.home() / ".claude/local/claude"),
+            "/usr/local/bin/claude", "/opt/homebrew/bin/claude",
+        ) if Path(p).is_file() and os.access(p, os.X_OK)),
+        None,
+    )
+
+
+# Двухмозговая схема: думающие роли (ассистент/аналитик/чат — полностью
+# конфайнутые вызовы без доступа к файлам) идут на Claude Opus по Max-подписке,
+# правки кода (bridge) и всё с write-доступом остаются на Codex. Два пула
+# лимитов вместо одного; при ошибке Claude свежий вызов тихо падает на Codex.
+CLAUDE_BIN = _find_claude()
+CLAUDE_MODEL = os.getenv("MRSEO_CLAUDE_MODEL", "opus").strip()
+BRAIN_PRIMARY = os.getenv("MRSEO_BRAIN", "claude").strip()  # claude | codex
+_CLAUDE_SID = "claude:"
+# нейтральный пустой cwd: в headless-режиме чтение вне cwd авто-запрещено,
+# так Claude физически не дотягивается до credentials/ и снапшотов
+_CLAUDE_HOME = Path(__file__).resolve().parent / ".brain_home"
 _ACTIVE_GROUPS: set[int] = set()
 _ACTIVE_LOCK = threading.Lock()
 _SIGNALS_READY = False
@@ -171,6 +198,129 @@ def _safe_detail(text: str) -> str:
     return redact_secrets(text)[-800:]
 
 
+def _run_claude(
+    prompt: str,
+    *,
+    timeout: int,
+    session_id: str | None,
+) -> tuple[str, str | None]:
+    """Headless `claude -p` (Opus по Max-подписке) для конфайнутых ролей.
+
+    Без инструментов: Bash/Write/Edit/Web запрещены явно, чтение вне пустого
+    cwd в -p режиме авто-запрещается. Сессии неймспейсятся «claude:<id>»,
+    старые codex-треды продолжают ходить в Codex.
+    """
+    _CLAUDE_HOME.mkdir(parents=True, exist_ok=True)
+    env = _clean_env()
+    cmd = [
+        CLAUDE_BIN, "-p", "--output-format", "json",
+        "--model", CLAUDE_MODEL,
+        "--strict-mcp-config",
+        "--disallowedTools",
+        "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,TodoWrite",
+    ]
+    if session_id:
+        cmd += ["--resume", session_id[len(_CLAUDE_SID):]]
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, cwd=str(_CLAUDE_HOME), env=env,
+        start_new_session=True,
+    )
+    with _ACTIVE_LOCK:
+        _ACTIVE_GROUPS.add(proc.pid)
+    try:
+        try:
+            stdout, stderr = proc.communicate(prompt, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                _kill_group(proc, force=True)
+                stdout, stderr = proc.communicate()
+            raise TimeoutError(f"Claude не ответил за {timeout} секунд")
+        try:
+            payload = json.loads(stdout or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        text = (payload.get("result") or "").strip()
+        if proc.returncode != 0 or payload.get("is_error") or not text:
+            raise RuntimeError(
+                f"claude rc={proc.returncode}: "
+                f"{_safe_detail(text or stderr or stdout or 'нет ответа')}"
+            )
+        sid = payload.get("session_id")
+        return text, (_CLAUDE_SID + sid) if sid else session_id
+    finally:
+        with _ACTIVE_LOCK:
+            _ACTIVE_GROUPS.discard(proc.pid)
+        _kill_group(proc, force=True)
+
+
+def _run_claude_repo(
+    prompt: str,
+    *,
+    root: Path,
+    timeout: int,
+    write: bool,
+) -> tuple[str, str | None]:
+    """Opus в репозитории: план (read-only) или правки (acceptEdits в worktree).
+
+    Секреты закрыты deny-правилами на Read; Bash/сеть запрещены всегда —
+    build-проверку делает сам bridge отдельным npm-процессом.
+    """
+    env = _clean_env()
+    deny = [
+        "Read(**/.env*)", "Read(**/credentials/**)", "Read(**/secrets/**)",
+        "Read(**/.git/**)", "Read(**/node_modules/**)",
+        "Bash", "WebFetch", "WebSearch", "Task", "Agent", "NotebookEdit",
+    ]
+    if not write:
+        deny += ["Write", "Edit", "MultiEdit"]
+    settings = json.dumps({"permissions": {"deny": deny}})
+    cmd = [
+        CLAUDE_BIN, "-p", "--output-format", "json",
+        "--model", CLAUDE_MODEL,
+        "--strict-mcp-config",
+        "--settings", settings,
+    ]
+    if write:
+        cmd += ["--permission-mode", "acceptEdits"]
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, cwd=str(root), env=env,
+        start_new_session=True,
+    )
+    with _ACTIVE_LOCK:
+        _ACTIVE_GROUPS.add(proc.pid)
+    try:
+        try:
+            stdout, stderr = proc.communicate(prompt, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                _kill_group(proc, force=True)
+                stdout, stderr = proc.communicate()
+            raise TimeoutError(f"Claude не ответил за {timeout} секунд")
+        try:
+            payload = json.loads(stdout or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        text = (payload.get("result") or "").strip()
+        if proc.returncode != 0 or payload.get("is_error") or not text:
+            raise RuntimeError(
+                f"claude-repo rc={proc.returncode}: "
+                f"{_safe_detail(text or stderr or stdout or 'нет ответа')}"
+            )
+        return text, None
+    finally:
+        with _ACTIVE_LOCK:
+            _ACTIVE_GROUPS.discard(proc.pid)
+        _kill_group(proc, force=True)
+
+
 def run(
     prompt: str,
     *,
@@ -201,6 +351,46 @@ def run(
         if not schema_path.is_file():
             raise ValueError(f"JSON schema не найдена: {schema_path}")
     _install_signal_handlers()
+    if read_paths is not None:
+        read_paths = tuple(read_paths)
+    if write_paths is not None:
+        write_paths = tuple(write_paths)
+    # Маршрутизация мозга: Claude Opus берёт только полностью конфайнутые
+    # вызовы (read_paths=() и write_paths=() — ассистент/аналитик/чат без
+    # файлового доступа); всё остальное (bridge, схемы) — Codex как раньше.
+    confined = read_paths == () and write_paths == ()
+    is_claude_session = bool(session_id) and session_id.startswith(_CLAUDE_SID)
+    if (
+        BRAIN_PRIMARY == "claude" and CLAUDE_BIN and confined
+        and output_schema is None
+        and (session_id is None or is_claude_session)
+    ):
+        try:
+            return _run_claude(prompt, timeout=timeout, session_id=session_id)
+        except Exception:
+            if is_claude_session:
+                raise  # claude-тред нельзя продолжить в codex
+            # свежий вызов: тихий фолбэк на codex, рой не умирает на лимитах
+    elif is_claude_session:
+        raise RuntimeError("claude-сессия, но Claude-мозг недоступен/выключен")
+    # Мост-режим: Opus работает прямо в репо (план или правки в worktree),
+    # если репо-доступ задан явно. Фолбэк — Codex как раньше.
+    repo_scoped = (
+        (read_paths and len(read_paths) == 1) if write_paths == () else
+        (write_paths and len(write_paths) == 1 and read_paths == ())
+    )
+    if (
+        os.getenv("MRSEO_BRIDGE_BRAIN", "claude").strip() == "claude"
+        and CLAUDE_BIN and repo_scoped and output_schema is None
+        and session_id is None
+    ):
+        try:
+            return _run_claude_repo(
+                prompt, root=root, timeout=timeout,
+                write=bool(write_paths),
+            )
+        except Exception:
+            pass  # фолбэк на codex ниже
     env = _clean_env()
     with tempfile.NamedTemporaryFile(prefix="mrseo-codex-", suffix=".txt", delete=False) as f:
         output_path = Path(f.name)

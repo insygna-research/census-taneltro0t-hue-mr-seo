@@ -13,7 +13,9 @@ push, после чего сайт забирает Timeweb autodeploy или Д
 """
 from contextlib import contextmanager
 import fcntl
+import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -41,6 +43,34 @@ GUARDRAILS = """
 - Правки должны быть минимальными и по задаче, в стиле окружающего кода.
 - В конце выведи короткий итог: какие файлы менял и зачем (или план, если read-only).
 """
+
+
+def _site_memory(site: str) -> str:
+    """Память ресурса для моста: уроки graveyard + вердикты гипотез сайта.
+
+    Модель должна знать, что уже пробовали, что подтвердилось и что убило
+    прошлые правки — иначе повторяет чужие могилы.
+    """
+    parts = ["# ПАМЯТЬ РЕСУРСА (уроки и эксперименты)"]
+    try:
+        gy = (ROOT / "carpathy" / "graveyard.md").read_text(encoding="utf-8")
+        parts += ["", "## Уроки кладбища (нарушать нельзя)", gy[:4000]]
+    except Exception:
+        pass
+    try:
+        hyps = json.loads((ROOT / "carpathy" / "hypotheses.json").read_text(encoding="utf-8"))["hypotheses"]
+        mine = [h for h in hyps if h.get("site") == site and h.get("status") in
+                ("confirmed", "falsified", "pending")][-12:]
+        if mine:
+            parts += ["", f"## Эксперименты по {site} (что уже пробовали)"]
+            for h in mine:
+                parts.append(
+                    f"- [{h.get('status')}] {h.get('commit_date','')}: "
+                    f"{str(h.get('change',''))[:140]}"
+                )
+    except Exception:
+        pass
+    return "\n".join(parts)
 
 
 def git(repo, *args, check=True):
@@ -122,10 +152,18 @@ def _delete_branch_if_present(repo: str, branch: str) -> None:
 
 def _apply_in_worktree(repo: str, site: str, task: str, base: str, report: list[str]) -> str:
     branch = f"mrseo/bridge-{TS}"
+    # worktree строится от чистого HEAD — грязь основной копии в ветку не
+    # попадает физически. Блокировать APPLY есть смысл только если она
+    # трогает те же исходники сайта; мусор тулинга (.agents/, .agent/,
+    # untracked) — лишь предупреждение в отчёте (фикс 06.08: три quick-win
+    # отменились из-за csv-файлов старого скилла).
     dirty = git(repo, "status", "--porcelain")
     if dirty:
-        report += ["## Отменено", "", "Основная рабочая копия содержит незакоммиченные изменения."]
-        return f"🌉 Bridge·APPLY {site}: отменён — репозиторий содержит незакоммиченные изменения"
+        report += [
+            "## Предупреждение", "",
+            "Основная копия не чиста (в ветку это не попадает — worktree от HEAD):",
+            "```", dirty[:600], "```", "",
+        ]
 
     temp_root = Path(tempfile.mkdtemp(prefix=f"mrseo-{site}-"))
     worktree = temp_root / "worktree"
@@ -154,7 +192,27 @@ def _apply_in_worktree(repo: str, site: str, task: str, base: str, report: list[
 
         build_note = "build: пропущен (нет package.json)"
         if (worktree / "package.json").exists():
+            # worktree = чистое дерево git: node_modules и .env* туда не попадают,
+            # без них next build падает кодом 127 — линкуем/копируем из основного репо
+            main_repo = Path(repo).resolve()
+            modules = main_repo / "node_modules"
+            if modules.is_dir() and not (worktree / "node_modules").exists():
+                # Сначала symlink (мгновенно; webpack/vite резолвят нормально).
+                # Клон 16k файлов больше не дефолт: на iCloud-evicted Desktop
+                # он превращается в часы сетевых запросов (инцидент 06.08).
+                (worktree / "node_modules").symlink_to(modules)
+            for envf in main_repo.glob(".env*"):
+                if envf.is_file() and not (worktree / envf.name).exists():
+                    shutil.copy2(envf, worktree / envf.name)
             rc, build_output = _run_build(str(worktree))
+            if rc != 0 and "ymlink" in build_output and (worktree / "node_modules").is_symlink():
+                # Turbopack отвергает symlink вне корня (осн) — фолбэк: клон
+                (worktree / "node_modules").unlink()
+                subprocess.run(
+                    ["cp", "-Rc", str(modules), str(worktree / "node_modules")],
+                    check=True, capture_output=True, timeout=1800,
+                )
+                rc, build_output = _run_build(str(worktree))
             if rc != 0:
                 report += [
                     "## Проверка", "",
@@ -221,7 +279,7 @@ def main():
     base = (
         f"Ты работаешь в репозитории сайта ({site}). Задача от Mr.Seo:\n\n"
         f"{task}\n{GUARDRAILS}\n\n# ПОСТОЯННАЯ СТРАТЕГИЯ MR SEO\n\n"
-        f"{strategy_context()}"
+        f"{strategy_context()}\n\n{_site_memory(site)}"
     )
     report = [
         f"# Bridge {TS} · {site} · {'APPLY' if apply_mode else 'PLAN'}",

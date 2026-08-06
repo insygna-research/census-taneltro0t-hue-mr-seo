@@ -26,6 +26,10 @@ sys.path.insert(0, str(ROOT))
 INBOX = ROOT / "swarm" / "tasks" / "inbox.md"
 PY = str(ROOT / "venv" / "bin" / "python")
 
+
+class _SkipBridge(Exception):
+    """Мост пропущен в этом заходе (нет сети) — задача остаётся в очереди."""
+
 # универсально: [любой-тег site] — quick-win/decay/cannibal/chat/фокус и будущие
 TASK_RE = re.compile(r"^- \[(?P<ts>[^\]✓]+)\] \[(?P<tag>[\w-]+|фокус) (?P<site>\w+)\] (?P<text>.+)$")
 MAX_PER_RUN = 4  # не переполняем 2ч-цикл: хвост доберёт следующий прогон
@@ -97,8 +101,20 @@ def process() -> list[str]:
         steps.append("indexnow ✓" if ix.get("ok") else "indexnow —")
         # 2) Мост готовит только read-only план. Автоматический apply отключён:
         #    ветку с изменениями можно создавать лишь явным действием человека.
+        # Ночью 06.08 Codex падал на DNS (сеть спала), а задачи всё равно
+        # помечались ✓ — теперь: сетевой pre-check, а без плана задача
+        # остаётся в очереди (до 3 попыток).
         plan_note = "мост —"
+        import socket as _s
         try:
+            _s.getaddrinfo("chatgpt.com", 443)
+            net_ok = True
+        except OSError:
+            net_ok = False
+            plan_note = "мост отложен (сеть недоступна)"
+        try:
+            if not net_ok:
+                raise _SkipBridge()
             r = subprocess.run([PY, str(ROOT / "swarm" / "bridge.py"), site,
                                 f"Задача роя: {text[:220]}. Подготовь минимальный план правок по задаче (страница {url})"],
                                capture_output=True, text=True, timeout=700, cwd=str(ROOT))
@@ -109,11 +125,25 @@ def process() -> list[str]:
                 mm = re.search(r"отчёт: (\S+)", r.stdout)
                 detail = r.stdout[-60:] if r.stdout else f"код {r.returncode}"
                 plan_note = f"мост: {Path(mm.group(1)).name if mm else detail}"
+        except _SkipBridge:
+            pass
         except Exception as e:
             plan_note = f"мост ✗ ({str(e)[:40]})"
         steps.append(plan_note)
         stamp = datetime.now().strftime("%m-%d %H:%M")
-        out_lines.append(ln + f"  → ✓ {stamp}: {'; '.join(steps)}")
+        plan_ok = plan_note.startswith(("план готов", "мост —"))
+        if plan_ok:
+            out_lines.append(ln + f"  → ✓ {stamp}: {'; '.join(steps)}")
+        else:
+            # честный статус: без плана задача не «сделана» — оставляем
+            # в очереди со счётчиком, после 3 неудач помечаем ✗
+            rm = re.search(r" · retry (\d+)$", ln)
+            tries = (int(rm.group(1)) if rm else 0) + 1
+            bare = re.sub(r" · retry \d+$", "", ln)
+            if tries >= 3:
+                out_lines.append(bare + f"  → ✗ {stamp}: {'; '.join(steps)} (3 попытки)")
+            else:
+                out_lines.append(bare + f" · retry {tries}")
         done_reports.append(f"«{query}» [{site}]: {'; '.join(steps)}")
     INBOX.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
     _status("idle")

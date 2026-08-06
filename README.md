@@ -8,7 +8,9 @@
 > tracks your positions daily, explains complex data in plain words, finds
 > "one-move wins", drafts fixes for your site in an isolated git branch — and
 > **proves** every action with position charts. AI inference runs through **your own
-> Claude subscription** (via the official Claude Code CLI) — $0 in API costs.
+> Claude and/or ChatGPT subscription** (official Claude Code / Codex CLI) — $0 in API
+> costs. Dual-brain: thinking roles go to Claude Opus, code edits go to Codex, and if
+> one hits its rate limit the other picks up automatically — the swarm never dies.
 
 ---
 
@@ -115,8 +117,10 @@ Issues and PRs are very welcome. Free while we polish the machine together.
 > Open-source SEO-центр для **Яндекса и Google**: рой ИИ-агентов ежедневно снимает
 > позиции, объясняет сложные данные простым языком, находит запросы «дожать за один
 > ход», сам готовит правки сайта в отдельной git-ветке — и **доказывает** каждое
-> действие графиком позиций. Инференс — через **вашу подписку Claude** (официальный
-> Claude Code CLI): $0 расходов на API.
+> действие графиком позиций. Инференс — через **вашу подписку Claude и/или ChatGPT**
+> (официальные Claude Code / Codex CLI): $0 расходов на API. Два мозга: думающие роли
+> — Claude Opus, правки кода — Codex, при лимите одного второй подхватывает
+> автоматически — рой не умирает никогда.
 
 ## 👋 От автора
 
